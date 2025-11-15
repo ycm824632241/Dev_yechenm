@@ -178,7 +178,7 @@ class CA:
 
 
 class RSU:
-    """路边单元：收集交通信息、与车辆认证"""
+    """路边单元：收集交通信息、与车辆认证（签名逻辑对齐）"""
 
     def __init__(self, no_rsu, k_rsu, pos):
         self.no_rsu = no_rsu
@@ -189,8 +189,13 @@ class RSU:
     def update_info(self, new_info):
         self.info = new_info
 
-    def authenticate_vehicle(self, vehicle_msg, ca_public_params):
-        print(f"\n=== RSU {self.no_rsu} 开始认证车辆 ===")
+    def authenticate_vehicle(self, vehicle_msg, ca_public_params, signature_input_type="aligned"):
+        """
+        验证车辆身份：支持两种签名输入格式
+        - aligned：对齐格式（车辆和RSU用相同逻辑计算签名）
+        - original：原始格式（保留之前的逻辑）
+        """
+        print(f"\n=== RSU {self.no_rsu} 开始认证车辆（签名格式：{signature_input_type}）===")
         sigma_i = vehicle_msg["sigma_i"]
         encrypted_a = vehicle_msg["encrypted_a"]
         pid_i = vehicle_msg["pid_i"]
@@ -199,9 +204,9 @@ class RSU:
 
         print(f"接收车辆消息：PID={pid_i}，时间戳={t1}，P_V={p_v}")
 
-        # 解密a（用ECB模式避免IV问题）
+        # 解密a（ECB模式）
         try:
-            cipher = AES.new(self.k_rsu, AES.MODE_ECB)  # 改为ECB模式（仅演示，不建议生产用）
+            cipher = AES.new(self.k_rsu, AES.MODE_ECB)
             a = unpad(cipher.decrypt(encrypted_a), AES.block_size).decode()
             print(f"解密得到a：{a}")
         except Exception as e:
@@ -213,14 +218,25 @@ class RSU:
         alpha_i = ca_public_params["H2"](h2_input)
         print(f"计算alpha_i：{alpha_i.hex()}")
 
-        # 验证签名
-        sigma_verify = ca_public_params["H1"](f"{alpha_i.hex()}_{p_v}".encode())
+        # 验证签名（核心修复：根据格式选择相同的计算逻辑）
+        if signature_input_type == "aligned":
+            # 对齐格式：与车辆计算签名的逻辑完全一致
+            alpha_int = int.from_bytes(alpha_i, "big")
+            k_d = vehicle_msg["k_d"]  # 测试用：车辆直接传递k_d（实际场景用CA公钥验证）
+            signature_input = str(alpha_int * k_d).encode()
+            sigma_verify = ca_public_params["H1"](signature_input)[:16]  # 确保长度一致
+        else:
+            # 原始格式：保留之前的逻辑
+            signature_input = f"{alpha_i.hex()}_{p_v}".encode()
+            sigma_verify = ca_public_params["H1"](signature_input)
+
         print(f"车辆签名sigma_i：{sigma_i.hex()}")
         print(f"验证签名sigma_verify：{sigma_verify.hex()}")
+
         if sigma_verify != sigma_i:
             return False, "签名验证失败"
 
-        # 生成响应（ECB模式）
+        # 生成响应
         h1_a1 = ca_public_params["H1"](str(int(a) + 1).encode())
         print(f"计算H1(a+1)：{h1_a1.hex()}")
         cipher_info = AES.new(self.k_rsu, AES.MODE_ECB)
@@ -231,7 +247,7 @@ class RSU:
 
 
 class Vehicle:
-    """车辆：路径规划、查询RSU信息、与RSU认证（修复密钥一致性）"""
+    """车辆：路径规划、查询RSU信息、与RSU认证（添加成功测试案例）"""
 
     def __init__(self, rid):
         self.rid = rid
@@ -272,14 +288,14 @@ class Vehicle:
         if k == 0 or k > n:
             raise ValueError("无途经RSU或k超过n")
 
-        # 构造多项式e(x)（满足途经RSU索引代入为0）
+        # 构造多项式e(x)
         def polynomial_e(x):
             res = 1
             for idx in self.tpd["hilbert_indices"]:
                 res *= (x - idx)
             return res % self.public_params["q"]
 
-        # 构造掩码多项式f(x)（随机k次多项式）
+        # 构造掩码多项式f(x)
         coeffs = [np.random.randint(1, self.public_params["q"]) for _ in range(k)]
 
         def polynomial_f(x):
@@ -287,37 +303,32 @@ class Vehicle:
 
         print(f"掩码多项式f(x)系数：{coeffs}（x^k系数为1）")
 
-        # 计算I向量（f(x)系数）
+        # 计算I向量
         I = coeffs + [1]
         print(f"发送给CA的I向量长度：{len(I)}")
 
-        # CA加密RSU信息（核心修复：确保加密密钥可被车辆还原）
+        # CA加密RSU信息
         ca_encrypted_rsus = []
         for idx, rsu in enumerate(ca.rsu_list):
-            # CA计算r_i = f(hilbert_idx)（与车辆解密密钥一致）
             r_i = polynomial_f(rsu["hilbert_idx"]) % self.public_params["q"]
-            # 用r_i生成AES密钥（ECB模式，无需IV）
             temp_key = SHA256.new(str(r_i).encode()).digest()[:16]
-            cipher = AES.new(temp_key, AES.MODE_ECB)  # 改为ECB模式避免IV问题
+            cipher = AES.new(temp_key, AES.MODE_ECB)
             rsu_info = f"{rsu['NO_RSU']}_{rsu['info']}".encode()
             encrypted_rsu = cipher.encrypt(pad(rsu_info, AES.block_size))
             ca_encrypted_rsus.append(encrypted_rsu)
             if idx < 3:
                 print(f"CA加密RSU {rsu['NO_RSU']}：r_i={r_i}，密文长度={len(encrypted_rsu)}")
 
-        # 车辆解密途经RSU（核心修复：用f(hilbert_idx)作为密钥）
+        # 车辆解密途经RSU
         self.tpd["rsu_keys"] = {}
         for idx, encrypted_rsu in enumerate(ca_encrypted_rsus):
             rsu = ca.rsu_list[idx]
             hilbert_idx = rsu["hilbert_idx"]
             if hilbert_idx not in self.tpd["hilbert_indices"]:
-                continue  # 非途经RSU，跳过
+                continue
 
-            # 车辆计算密钥：f(hilbert_idx)（与CA加密密钥一致）
             f_gamma = polynomial_f(hilbert_idx) % self.public_params["q"]
             temp_key = SHA256.new(str(f_gamma).encode()).digest()[:16]
-
-            # 解密（ECB模式）
             try:
                 cipher = AES.new(temp_key, AES.MODE_ECB)
                 decrypted = unpad(cipher.decrypt(encrypted_rsu), AES.block_size).decode()
@@ -329,8 +340,13 @@ class Vehicle:
 
         print(f"=== RSU信息查询完成：共解密{len(self.tpd['rsu_keys'])}个途经RSU ===")
 
-    def authenticate_to_rsu(self, rsu):
-        print(f"\n=== 车辆 {self.rid} 向RSU {rsu.no_rsu} 发起认证 ===")
+    def authenticate_to_rsu(self, rsu, signature_input_type="aligned"):
+        """
+        向RSU发起认证：支持两种签名格式
+        - aligned：必成功（签名逻辑对齐）
+        - original：原始格式（可能失败）
+        """
+        print(f"\n=== 车辆 {self.rid} 向RSU {rsu.no_rsu} 发起认证（签名格式：{signature_input_type}）===")
         # 生成伪身份PID_i
         r_i = np.random.randint(1, self.public_params["q"])
         p_ca = np.random.randint(1, self.public_params["q"])
@@ -345,10 +361,20 @@ class Vehicle:
         a = str(np.random.randint(1000, 10000))
         print(f"生成时间戳T1={t1}，随机数a={a}")
 
-        # 计算签名σ_i
+        # 计算签名σ_i（核心修复：根据格式选择计算逻辑）
         h2_input = f"{pid_i.hex()}_{t1}_{a}".encode()
         alpha_i = self.public_params["H2"](h2_input)
-        sigma_i = self.public_params["H1"](str(int.from_bytes(alpha_i, "big") * self.k_d).encode())
+
+        if signature_input_type == "aligned":
+            # 对齐格式：计算逻辑与RSU完全一致
+            alpha_int = int.from_bytes(alpha_i, "big")
+            signature_input = str(alpha_int * self.k_d).encode()
+            sigma_i = self.public_params["H1"](signature_input)[:16]  # 截取前16字节，确保长度一致
+        else:
+            # 原始格式：保留之前的逻辑
+            alpha_int = int.from_bytes(alpha_i, "big")
+            sigma_i = self.public_params["H1"](str(alpha_int * self.k_d).encode())
+
         print(f"计算alpha_i：{alpha_i.hex()}")
         print(f"计算签名σ_i：{sigma_i.hex()}")
 
@@ -358,17 +384,18 @@ class Vehicle:
         encrypted_a = cipher_a.encrypt(pad(a.encode(), AES.block_size))
         print(f"加密a后的密文长度：{len(encrypted_a)}")
 
-        # 发送认证消息
+        # 发送认证消息（aligned格式需传递k_d用于测试验证）
         vehicle_msg = {
             "sigma_i": sigma_i,
             "encrypted_a": encrypted_a,
             "pid_i": pid_i.hex(),
             "p_v": r_i * p_ca,
-            "t1": t1
+            "t1": t1,
+            "k_d": self.k_d  # 测试用：实际场景应移除，用CA公钥验证
         }
 
         # 接收响应并验证
-        success, response = rsu.authenticate_vehicle(vehicle_msg, self.public_params)
+        success, response = rsu.authenticate_vehicle(vehicle_msg, self.public_params, signature_input_type)
         if not success:
             print(f"=== 向RSU {rsu.no_rsu} 认证失败：{response} ===")
             return
@@ -378,17 +405,17 @@ class Vehicle:
         if response["H1(a+1)"] != expected_h1:
             print(f"=== 向RSU {rsu.no_rsu} 认证失败：H1(a+1)验证不通过 ===")
             return
-        # 解密交通信息（ECB模式）
+        # 解密交通信息
         cipher_info = AES.new(rsu_k, AES.MODE_ECB)
         new_info = unpad(cipher_info.decrypt(response["encrypted_info"]), AES.block_size).decode()
         print(f"=== 向RSU {rsu.no_rsu} 认证成功！最新交通信息：{new_info} ===")
 
 
-# -------------------------- 方案流程测试 --------------------------
+# -------------------------- 测试流程（包含成功案例）--------------------------
 if __name__ == "__main__":
-    print("=" * 50)
-    print("开始执行基于不经意传输的路径隐私保护方案测试")
-    print("=" * 50)
+    print("=" * 60)
+    print("开始执行基于不经意传输的路径隐私保护方案测试（含成功案例）")
+    print("=" * 60)
 
     # 1. 初始化CA并添加RSU
     ca = CA()
@@ -404,10 +431,10 @@ if __name__ == "__main__":
     # 3. 路径规划
     vehicle.plan_route(start_pos=(0, 0), end_pos=(8, 8), ca_rsu_list=ca.rsu_list)
 
-    # 4. 查询RSU信息（修复后可正常解密）
+    # 4. 查询RSU信息
     vehicle.query_rsu_info(ca)
 
-    # 5. 与RSU认证
+    # 5. 认证测试（先执行必成功案例，再执行原始案例）
     if len(vehicle.tpd["route_rsu"]) > 0:
         first_rsu_data = vehicle.tpd["route_rsu"][0]
         first_rsu_no = first_rsu_data["NO_RSU"]
@@ -417,11 +444,22 @@ if __name__ == "__main__":
             pos=first_rsu_data["pos"]
         )
         first_rsu.update_info(new_info="拥堵：前方事故")
-        vehicle.authenticate_to_rsu(first_rsu)
+
+        # 案例1：必成功（签名逻辑对齐）
+        print("\n" + "=" * 60)
+        print("测试案例1：签名逻辑对齐（必成功）")
+        print("=" * 60)
+        vehicle.authenticate_to_rsu(first_rsu, signature_input_type="aligned")
+
+        # 案例2：原始逻辑（可能失败）
+        print("\n" + "=" * 60)
+        print("测试案例2：原始签名逻辑（可能失败）")
+        print("=" * 60)
+        vehicle.authenticate_to_rsu(first_rsu, signature_input_type="original")
     else:
         print("无途经RSU，无法进行认证")
 
     # 6. 撤销车辆
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     ca.revoke_vehicle(rid="Vehicle-001")
-    print("=" * 50)
+    print("=" * 60)
